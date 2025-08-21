@@ -1,2 +1,10 @@
-streamlit 
-pandas 
+streamlit
+pandas
+numpy
+openpyxl
+xlrd
+scipy
+scikit-learn
+matplotlib
+seaborn
+Pillow
