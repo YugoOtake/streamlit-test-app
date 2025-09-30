@@ -4,125 +4,132 @@ import shutil
 import importlib.util
 import time
 from datetime import datetime
+import zipfile
 
 # Streamlitアプリケーションの設定
-st.set_page_config(layout="centered", page_title="ファイル処理自動化ツール (ローカルPC専用)")
+st.set_page_config(layout="centered", page_title="ファイル処理自動化ツール (Cloud/ファイルアップロード)")
 
 # --- st.session_state の初期化をアプリの最上部で行う ---
 # これにより、アプリの再実行時にも状態が保持され、key の衝突を防ぐ
-# operation_mode_selection の選択肢を「ローカルPC (フォルダパス指定)」のみに限定
-if 'operation_mode_selection' not in st.session_state:
-    st.session_state.operation_mode_selection = "ローカルPC (フォルダパス指定)" # デフォルト値を固定
-
+# operation_mode_selection は不要になるため削除（ファイルアップロード方式に固定）
 if 'script_source_selection' not in st.session_state:
-    st.session_state.script_source_selection = "ローカルパスを指定" # デフォルトをローカルパス指定に固定
+    st.session_state.script_source_selection = "ファイルをアップロード" # デフォルトをファイルアップロードに固定
 
-# --- クリーンアップ関数はStreamlit Cloud関連なので削除 ---
+# --- アプリケーション終了時のクリーンアップ ---
+# Streamlit Cloudの一時ディレクトリは毎回クリーンアップ
+@st.cache_data(ttl=3600) # 1時間キャッシュ
+def cleanup_temp_dirs_cloud_mode():
+    if os.path.exists("temp_uploaded_input"):
+        shutil.rmtree("temp_uploaded_input")
+    if os.path.exists("temp_script"):
+        shutil.rmtree("temp_script")
+    if os.path.exists("temp_output_cloud"):
+        shutil.rmtree("temp_output_cloud")
+    if os.path.exists("processed_files.zip"):
+        os.remove("processed_files.zip")
 
-st.title("📂 ファイル処理自動化ツール (ローカルPC専用)")
+# アプリケーション起動時に一度だけ実行
+if 'cleaned_up_cloud_mode' not in st.session_state:
+    cleanup_temp_dirs_cloud_mode()
+    st.session_state['cleaned_up_cloud_mode'] = True
+
+st.title("📂 ファイル処理自動化ツール (Cloud/ファイルアップロード)")
 st.markdown("---")
 
-# --- モード選択 ---
-st.header("利用モードの選択")
+# --- 利用モードの表示 (固定) ---
+st.header("利用モード: Streamlit Cloud (ファイルアップロード/ダウンロード)")
+st.info("このアプリケーションは、Webブラウザからファイルをアップロードして利用します。")
+st.markdown("---")
 
-# st.radio の選択肢を「ローカルPC (フォルダパス指定)」のみに限定
-operation_mode = st.radio(
-    "どちらのモードで利用しますか？",
-    ("ローカルPC (フォルダパス指定)",), # 選択肢を一つに限定
-    key="operation_mode_selection",
-    help="このツールはローカルPCでのフォルダパス指定に特化しています。",
-    index=0 # 常に最初の選択肢を選択
+# --- 入力ファイルのアップロード (Streamlit Cloudモードのみ) ---
+temp_input_dir = ""
+
+st.header("1. 入力ファイルのアップロード")
+
+uploaded_files = st.file_uploader(
+    "処理したいファイルをアップロードしてください (複数選択可)",
+    type=None, # 任意のファイルタイプを受け入れる
+    accept_multiple_files=True,
+    key="input_file_uploader"
 )
 
-# 以降の条件分岐では、st.session_state.operation_mode_selection を直接参照する
-# (st.radioの戻り値 operation_mode も同じ値を持つが、一貫性のためにセッションステートを参照)
+if not uploaded_files:
+    st.warning("処理するファイルをアップロードしてください。")
+    st.stop()
+
+# アップロードされたファイルを一時的に保存するディレクトリ
+temp_input_dir = "temp_uploaded_input"
+os.makedirs(temp_input_dir, exist_ok=True)
+
+# 以前のファイルを削除
+for filename in os.listdir(temp_input_dir):
+    file_path = os.path.join(temp_input_dir, filename)
+    try:
+        if os.path.isfile(file_path) or os.path.islink(file_path):
+            os.unlink(file_path)
+        elif os.path.isdir(file_path):
+            shutil.rmtree(file_path)
+    except Exception as e:
+        st.error(f"一時入力ディレクトリのクリア中にエラーが発生しました: {e}")
+
+# アップロードされたファイルを一時ディレクトリに保存
+for uploaded_file in uploaded_files:
+    file_path = os.path.join(temp_input_dir, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.success(f"ファイルを保存しました: {uploaded_file.name}")
+
+input_dir = temp_input_dir # 処理スクリプトに渡す入力ディレクトリを一時ディレクトリに設定
+output_dir = "temp_output_cloud" # クラウドモード用の一時出力ディレクトリ
+os.makedirs(output_dir, exist_ok=True) # 作成
 
 st.markdown("---")
-
-# --- 入力/出力ディレクトリのパス指定 (ローカルPCモードのみ) ---
-input_dir = ""
-output_dir = ""
-
-# operation_mode_selection が "ローカルPC (フォルダパス指定)" の場合のみ表示されるが、
-# 上記で選択肢を一つに固定したため、常に表示されるようになる
-if st.session_state.operation_mode_selection == "ローカルPC (フォルダパス指定)":
-    st.header("1. 入力/出力フォルダの指定")
-    st.warning("この機能は、**ローカルPCでStreamlitアプリを実行している場合のみ**有効です。") # Streamlit Cloudでは動作しません の文言を削除
-
-    input_dir = st.text_input(
-        "入力フォルダのパスを入力してください (例: C:/Users/YourName/InputData)",
-        value="./input", # デフォルト値を設定
-        key="input_folder_path",
-        help="処理したいファイルが保存されているフォルダの絶対パスまたは相対パスを指定してください。"
-    )
-    output_dir = st.text_input(
-        "出力フォルダのパスを入力してください (例: C:/Users/YourName/OutputData)",
-        value="./output", # デフォルト値を設定
-        key="output_folder_path",
-        help="処理結果を保存するフォルダの絶対パスまたは相対パスを指定してください。存在しない場合は自動で作成されます。"
-    )
-
-    # フォルダの存在確認と作成
-    if input_dir:
-        if not os.path.isdir(input_dir):
-            st.error(f"指定された入力フォルダが見つかりません: {input_dir}")
-            st.stop()
-    else:
-        st.warning("入力フォルダが指定されていません。")
-        st.stop()
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    else:
-        st.warning("出力フォルダが指定されていません。処理結果はダウンロードできません。")
-        st.stop()
-
-    st.markdown("---")
-
-# --- 入力ファイルのアップロード (Streamlit Cloudモードのみ) は完全に削除 ---
 
 # --- 処理スクリプトのアップロード/指定 ---
 st.header("2. 処理スクリプトの指定 (.pyファイル)")
 
-# script_source の選択肢から「ファイルをアップロード」を削除し、デフォルトを「ローカルパスを指定」に固定
+# script_source の選択肢を「ファイルをアップロード」のみに限定
 script_source = st.radio(
     "処理スクリプトの指定方法を選択してください",
-    ("ローカルパスを指定",), # 選択肢を一つに限定
+    ("ファイルをアップロード",), # 選択肢を一つに限定
     key="script_source_selection",
-    help="ローカルPC上のPythonスクリプトのパスを指定してください。",
+    help="処理ロジックを含むPythonスクリプト (.py) をアップロードしてください。",
     index=0 # 常に最初の選択肢を選択
 )
 
 temp_script_path = ""
 
-# Streamlit Cloud関連の条件分岐を削除し、ローカルパス指定に一本化
-if script_source == "ローカルパスを指定":
-    local_script_path = st.text_input(
-        "処理スクリプトのパスを入力してください (例: C:/Scripts/my_processor.py)",
-        key="local_script_path_input",
-        help="処理ロジックを含むPythonスクリプトの絶対パスまたは相対パスを指定してください。"
+# ファイルアップロードのロジックを固定
+if script_source == "ファイルをアップロード":
+    uploaded_script = st.file_uploader(
+        "処理ロジックを含むPythonスクリプト (.py) をアップロードしてください",
+        type="py",
+        key="script_file_uploader"
     )
-    if not local_script_path:
-        st.warning("処理スクリプトのパスを入力してください。")
+
+    if not uploaded_script:
+        st.warning("処理スクリプトをアップロードしてください。")
         st.stop()
-    if not os.path.isfile(local_script_path):
-        st.error(f"指定された処理スクリプトが見つかりません: {local_script_path}")
-        st.stop()
-    if not local_script_path.endswith('.py'):
-        st.error("指定されたファイルはPythonスクリプト (.py) ではありません。")
-        st.stop()
-    
-    temp_script_path = local_script_path # ローカルパスを直接使用
+
+    # アップロードされたスクリプトを一時的に保存
+    temp_script_path = os.path.join("temp_script", uploaded_script.name)
+    os.makedirs(os.path.dirname(temp_script_path), exist_ok=True)
+
+    with open(temp_script_path, "wb") as f:
+        f.write(uploaded_script.getbuffer())
+    st.success(f"処理スクリプトを保存しました: {uploaded_script.name}")
 
 st.markdown("---")
 
 # --- 処理実行ボタン ---
 st.header("3. 処理の実行")
-if st.button("処理を開始する", help="指定されたファイル/フォルダとスクリプトで処理を実行します", key="start_processing_button"):
+if st.button("処理を開始する", help="指定されたファイルとスクリプトで処理を実行します", key="start_processing_button"):
     st.write("処理を開始します...")
 
-    # ローカルPCモードなので、出力ディレクトリは常にユーザーが管理
-    # Streamlit Cloud関連の出力ディレクトリクリアロジックは削除
+    # クラウドモードなので、出力ディレクトリは毎回クリア
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir) # 以前の出力をクリア
+    os.makedirs(output_dir, exist_ok=True)
 
     try:
         # スクリプトをモジュールとしてロード
@@ -182,11 +189,35 @@ if st.button("処理を開始する", help="指定されたファイル/フォ�
         st.error(f"処理中にエラーが発生しました: {e}")
         st.exception(e) # 詳細なエラーメッセージを表示
 
-    # --- 処理結果のダウンロード (Streamlit Cloudモードのみ) は削除 ---
+    # --- 処理結果のダウンロード (Streamlit Cloudモード) ---
     st.markdown("---")
-    st.write("処理結果は指定された出力フォルダに保存されています。")
+    st.header("4. 処理結果のダウンロード")
 
-# --- アプリケーション終了時のクリーンアップ (Streamlit Cloud関連なので削除) ---
+    if os.path.exists(output_dir) and os.listdir(output_dir):
+        zip_file_path = "processed_files.zip"
+        # 以前のZIPファイルを削除
+        if os.path.exists(zip_file_path):
+            os.remove(zip_file_path)
+
+        # 出力ディレクトリをZIP圧縮
+        with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(output_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, output_dir) # ZIP内のパス
+                    zipf.write(file_path, arcname)
+
+        with open(zip_file_path, "rb") as f:
+            st.download_button(
+                label="処理結果をダウンロード (ZIP)",
+                data=f.read(),
+                file_name="processed_files.zip",
+                mime="application/zip",
+                key="download_button"
+            )
+        st.success("ダウンロード準備ができました。")
+    else:
+        st.info("出力ファイルがありません。処理が成功したか確認してください。")
 
 st.markdown("---")
 st.write("ご不明な点があればお問い合わせください。")
